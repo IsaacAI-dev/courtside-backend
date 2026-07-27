@@ -1,0 +1,29 @@
+{
+  "version": "1.0.0",
+  "weights": { "hitrate": 0.30, "cushion": 0.28, "consistency": 0.15, "minutes": 0.15, "matchup": 0.12 },
+  "cushion": { "scale": 28, "sigmaFloor": 0.5 },
+  "consistency": { "cvRef": { "POINTS": 0.45, "REBOUNDS": 0.55, "ASSISTS": 0.60, "THREES": 0.80 } },
+  "minutes": { "volatilityPenalty": 140, "trendBonus": 6, "hardFloorMinutes": 20, "targetMinutes": 34 },
+  "matchup": { "paceWeight": 1.6, "defWeight": 1.2, "positionalWeight": 0.8 },
+  "wilson": { "z": 1.2816, "windowBlend": { "l5": 0.55, "l10": 0.30, "season": 0.15 } },
+  "multipliers": {
+    "backToBack": 0.92,
+    "thirdInFour": 0.86,
+    "firstGameBack": 0.55,
+    "blowoutRisk": 0.90,
+    "blowoutSpreadThreshold": 12,
+    "teammateReturning": 0.88,
+    "teammateOut": 1.06,
+    "roadNegativeSplit": 0.96,
+    "fuzzyEntityMatch": 0.85,
+    "staleLines": 0.90,
+    "staleLineMinutes": 90
+  },
+  "dataSufficiencyCaps": [
+    { "minGames": 20, "cap": 100 },
+    { "minGames": 10, "cap": 82 },
+    { "minGames": 5, "cap": 68 },
+    { "minGames": 0, "cap": 0 }
+  ],
+  "tiers": { "A": 80, "B": 68, "C": 55 }
+}

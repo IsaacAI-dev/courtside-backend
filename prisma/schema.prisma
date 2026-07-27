@@ -1,0 +1,457 @@
+// Courtside data model — spec §8.
+// SQLite today, PostgreSQL later: no enums, no Json type, no scalar lists,
+// no skipDuplicates. Strings validated by Zod at the boundary instead (§8.7).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite" // → "postgresql" at migration time
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────── REFERENCE ───────────────────────────
+
+model LeagueConfig {
+  id                String  @id // "NBA" | "WNBA"
+  displayName       String
+  statsHost         String // stats.nba.com | stats.wnba.com
+  statsLeagueId     String // "00" | "10"
+  statsReferer      String
+  seasonFormat      String // "YYYY-YY" | "YYYY"
+  currentSeason     String // "2026-27" | "2026"
+  espnPathSegment   String // "nba" | "wnba"
+  sofaTournamentId  Int? // resolved at runtime, cached
+  betanoPathSegment String
+  isActive          Boolean  @default(true)
+  updatedAt         DateTime @updatedAt
+
+  teams    Team[]
+  players  Player[]
+  fixtures Fixture[]
+  breaks   LeagueBreak[]
+}
+
+model LeagueBreak {
+  id                 String       @id @default(cuid())
+  leagueId           String
+  label              String // "FIBA Women's World Cup 2026"
+  startsAt           DateTime
+  endsAt             DateTime
+  suppressLayoffFlag Boolean      @default(true) // §3.2.1
+  league             LeagueConfig @relation(fields: [leagueId], references: [id])
+
+  @@index([leagueId, startsAt])
+}
+
+model Team {
+  id           String  @id @default(cuid())
+  leagueId     String
+  name         String // "Indiana Fever"
+  shortName    String // "Fever"
+  abbreviation String // "IND"
+  city         String?
+  conference   String?
+  logoUrl      String?
+
+  paceRating  Float? // possessions per 48/40
+  offRating   Float?
+  defRating   Float?
+  ratingsAsOf DateTime?
+
+  league       LeagueConfig @relation(fields: [leagueId], references: [id])
+  players      Player[]
+  homeFixtures Fixture[]    @relation("HomeTeam")
+  awayFixtures Fixture[]    @relation("AwayTeam")
+  aliases      TeamAlias[]
+
+  @@unique([leagueId, abbreviation])
+  @@index([leagueId, name])
+}
+
+model TeamAlias {
+  id         String  @id @default(cuid())
+  teamId     String
+  alias      String
+  normalised String // normaliseName() output
+  source     String? // null = universal
+  team       Team    @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@unique([normalised, source])
+  @@index([normalised])
+}
+
+model Player {
+  id           String  @id @default(cuid())
+  leagueId     String
+  teamId       String?
+  fullName     String
+  firstName    String
+  lastName     String
+  suffix       String? // "Jr", "III" — never folded into lastName (§6.4)
+  normalised   String // canonical match key
+  position     String?
+  jerseyNumber String?
+  headshotUrl  String?
+  isActive     Boolean @default(true)
+
+  league          LeagueConfig      @relation(fields: [leagueId], references: [id])
+  team            Team?             @relation(fields: [teamId], references: [id])
+  identities      SourceIdentity[]
+  aliases         PlayerAlias[]
+  gameLogs        PlayerGameLog[]
+  injuries        InjuryStatus[]
+  propLines       PropLine[]
+  recommendations Recommendation[]
+  exclusions      PlayerExclusion[]
+
+  @@index([leagueId, normalised])
+  @@index([teamId])
+}
+
+model PlayerAlias {
+  id         String  @id @default(cuid())
+  playerId   String
+  alias      String
+  normalised String
+  source     String?
+  player     Player  @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@unique([normalised, source])
+  @@index([normalised])
+}
+
+// One table for ALL external identity, players and teams alike (§6.2)
+model SourceIdentity {
+  id              String    @id @default(cuid())
+  entityType      String // "PLAYER" | "TEAM"
+  playerId        String?
+  teamId          String?
+  source          String // BETANO | SOFASCORE | LEAGUE | ESPN
+  externalId      String
+  rawName         String
+  matchConfidence Float     @default(1.0)
+  matchMethod     String // IDENTITY|ALIAS|EXACT|STRUCTURAL|FUZZY|MANUAL
+  verifiedAt      DateTime? // non-null = human confirmed
+  createdAt       DateTime  @default(now())
+
+  player Player? @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@unique([source, externalId, entityType])
+  @@index([playerId])
+  @@index([source, rawName])
+}
+
+// ─────────────────────────── FIXTURES ───────────────────────────
+
+model Fixture {
+  id         String   @id @default(cuid())
+  leagueId   String
+  homeTeamId String
+  awayTeamId String
+  startsAt   DateTime // UTC. ALWAYS UTC.
+  status     String   @default("SCHEDULED") // SCHEDULED|LIVE|FINAL|POSTPONED
+  venue      String?
+  season     String
+
+  reconciliationStatus String @default("PENDING")
+  // PENDING|MATCHED|FUZZY|UNMATCHED_BETANO_ONLY|UNMATCHED_SOFASCORE_ONLY|TIME_DISCREPANCY
+  reconciliationScore  Float?
+  timeDeltaMinutes     Int?
+
+  isBackToBackHome Boolean @default(false)
+  isBackToBackAway Boolean @default(false)
+  spread           Float? // blowout-risk multiplier input
+  total            Float?
+
+  league   LeagueConfig @relation(fields: [leagueId], references: [id])
+  homeTeam Team         @relation("HomeTeam", fields: [homeTeamId], references: [id])
+  awayTeam Team         @relation("AwayTeam", fields: [awayTeamId], references: [id])
+
+  sourceLinks     FixtureSourceLink[]
+  propLines       PropLine[]
+  recommendations Recommendation[]
+  exclusions      PlayerExclusion[]
+  gameLogs        PlayerGameLog[]
+
+  @@index([leagueId, startsAt])
+  @@index([startsAt, status])
+}
+
+model FixtureSourceLink {
+  id         String   @id @default(cuid())
+  fixtureId  String
+  source     String
+  externalId String
+  rawPayload String? // JSON string — SQLite has no Json type
+  capturedAt DateTime @default(now())
+  fixture    Fixture  @relation(fields: [fixtureId], references: [id], onDelete: Cascade)
+
+  @@unique([source, externalId])
+  @@index([fixtureId])
+}
+
+// ──────────────────── STATS / AVAILABILITY / LINES ────────────────────
+
+model PlayerGameLog {
+  id           String   @id @default(cuid())
+  playerId     String
+  fixtureId    String? // null for games predating ingestion
+  gameDate     DateTime
+  opponentAbbr String
+  isHome       Boolean
+  won          Boolean?
+
+  minutes     Float
+  points      Int
+  assists     Int
+  rebounds    Int
+  offRebounds Int?
+  defRebounds Int?
+  threesMade  Int
+  threesAtt   Int?
+  fgm         Int?
+  fga         Int?
+  ftm         Int?
+  fta         Int?
+  steals      Int?
+  blocks      Int?
+  turnovers   Int?
+  plusMinus   Int?
+
+  didNotPlay  Boolean  @default(false)
+  dnpReason   String?
+  startedGame Boolean?
+
+  source     String // LEAGUE | SOFASCORE | ESPN
+  ingestedAt DateTime @default(now())
+
+  player  Player   @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  fixture Fixture? @relation(fields: [fixtureId], references: [id])
+
+  @@unique([playerId, gameDate, source])
+  @@index([playerId, gameDate(sort: Desc)])
+}
+
+model InjuryStatus {
+  id         String   @id @default(cuid())
+  playerId   String
+  status     String // ACTIVE|PROBABLE|QUESTIONABLE|DOUBTFUL|OUT|INACTIVE|SUSPENDED|NOT_WITH_TEAM
+  reason     String? // "Left ankle sprain"
+  detail     String?
+  source     String // NBA_OFFICIAL|ESPN|SOFASCORE|MANUAL
+  reportedAt DateTime
+  capturedAt DateTime @default(now())
+  isCurrent  Boolean  @default(true) // prior rows flipped false — full history kept
+
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@index([playerId, isCurrent])
+  @@index([capturedAt])
+}
+
+model PropLine {
+  id            String   @id @default(cuid())
+  fixtureId     String
+  playerId      String
+  market        String // POINTS|ASSISTS|REBOUNDS|THREES
+  line          Float // 15.5
+  overOdds      Float? // decimal
+  underOdds     Float?
+  isMainLine    Boolean  @default(false)
+  bookmaker     String   @default("BETANO_NG")
+  capturedAt    DateTime @default(now())
+  rawMarketName String? // audit: exactly what the book called it
+
+  fixture Fixture @relation(fields: [fixtureId], references: [id], onDelete: Cascade)
+  player  Player  @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  // Deliberately NOT uniquely keyed — the capture sequence IS the movement history.
+  @@index([fixtureId, playerId, market])
+  @@index([capturedAt])
+}
+
+// ─────────────────────────── ANALYSIS ───────────────────────────
+
+model AnalysisRun {
+  id             String   @id @default(cuid())
+  leagueId       String
+  trigger        String // SCHEDULED_T90|SCHEDULED_T30|MANUAL|BACKFILL
+  windowStart    DateTime
+  windowEnd      DateTime
+  status         String   @default("RUNNING") // RUNNING|COMPLETED|DEGRADED|FAILED
+  scoringVersion String
+
+  fixturesConsidered     Int       @default(0)
+  playersConsidered      Int       @default(0)
+  playersExcluded        Int       @default(0)
+  recommendationsEmitted Int       @default(0)
+  sourceErrors           String? // JSON array
+  startedAt              DateTime  @default(now())
+  finishedAt             DateTime?
+  durationMs             Int?
+
+  recommendations Recommendation[]
+  exclusions      PlayerExclusion[]
+
+  @@index([leagueId, startedAt(sort: Desc)])
+}
+
+model PlayerExclusion {
+  id        String   @id @default(cuid())
+  runId     String
+  fixtureId String
+  playerId  String?
+  rawName   String // preserved even when unresolved
+  reason    String
+  // EXCLUDED_OUT | EXCLUDED_DOUBTFUL | EXCLUDED_DNP_PREVIOUS | EXCLUDED_RETURNING
+  // | UNRESOLVED_ENTITY | INSUFFICIENT_DATA | NO_LINE_MEETS_RULE
+  // | BELOW_BETANO_MINIMUM | BELOW_CONFIDENCE_FLOOR
+  detail    String?
+  createdAt DateTime @default(now())
+
+  run     AnalysisRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  fixture Fixture     @relation(fields: [fixtureId], references: [id])
+  player  Player?     @relation(fields: [playerId], references: [id])
+
+  @@index([runId, reason])
+}
+
+model Recommendation {
+  id        String @id @default(cuid())
+  runId     String
+  fixtureId String
+  playerId  String
+  market    String
+  side      String @default("OVER") // OVER | UNDER
+
+  recommendedLine Float
+  betanoMinLine   Float
+  betanoMaxLine   Float
+  offeredOdds     Float?
+  selectionMode   String // AGGRESSIVE|BALANCED|CONSERVATIVE
+
+  meanWeighted Float
+  meanSimple   Float
+  stdDev       Float
+  hitsL5       Int
+  gamesL5      Int
+  pushesL5     Int    @default(0)
+  hitsL10      Int
+  gamesL10     Int
+  hitRateL5    Float
+  hitRateL10   Float
+  seasonMean   Float?
+
+  confidence     Float // 0-100
+  tier           String // A|B|C
+  scoringVersion String
+
+  status     String   @default("ACTIVE") // ACTIVE|VOIDED_LATE_SCRATCH|VOIDED_LINE_MOVED|SETTLED
+  voidReason String?
+  createdAt  DateTime @default(now())
+
+  run     AnalysisRun            @relation(fields: [runId], references: [id], onDelete: Cascade)
+  fixture Fixture                @relation(fields: [fixtureId], references: [id])
+  player  Player                 @relation(fields: [playerId], references: [id])
+  factors RecommendationFactor[]
+  result  SettlementResult?
+
+  @@index([runId, confidence(sort: Desc)])
+  @@index([fixtureId, market])
+  @@index([status, createdAt])
+}
+
+model RecommendationFactor {
+  id               String         @id @default(cuid())
+  recommendationId String
+  kind             String // FACTOR | MULTIPLIER | CAP
+  name             String // "hitrate" | "cushion" | "backToBack" ...
+  value            Float // factor score 0-100, or multiplier e.g. 0.92
+  weight           Float?
+  contribution     Float? // value * weight
+  note             String?
+  recommendation   Recommendation @relation(fields: [recommendationId], references: [id], onDelete: Cascade)
+
+  @@index([recommendationId])
+}
+
+model SettlementResult {
+  id               String         @id @default(cuid())
+  recommendationId String         @unique
+  actualValue      Float // what the player actually recorded
+  outcome          String // WIN | LOSS | PUSH | VOID
+  minutesPlayed    Float?
+  settledAt        DateTime       @default(now())
+  recommendation   Recommendation @relation(fields: [recommendationId], references: [id], onDelete: Cascade)
+}
+
+// ─────────────────────────── OPERATIONAL ───────────────────────────
+
+model SourceCache {
+  id         String   @id @default(cuid())
+  source     String
+  endpoint   String
+  paramsHash String
+  payload    String // JSON string
+  shapeHash  String? // drift detection (§5.2.5)
+  fetchedAt  DateTime @default(now())
+  expiresAt  DateTime
+
+  @@unique([source, endpoint, paramsHash])
+  @@index([expiresAt])
+}
+
+model ScrapeLog {
+  id           String   @id @default(cuid())
+  source       String
+  operation    String
+  tier         String? // DIRECT | BROWSER
+  success      Boolean
+  httpStatus   Int?
+  durationMs   Int?
+  itemCount    Int?
+  errorMessage String?
+  shapeChanged Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  @@index([source, createdAt(sort: Desc)])
+}
+
+model EntityReviewItem {
+  id           String    @id @default(cuid())
+  source       String
+  rawName      String
+  rawTeam      String?
+  fixtureId    String?
+  candidates   String // JSON
+  status       String    @default("PENDING") // PENDING|RESOLVED|REJECTED
+  resolvedToId String?
+  createdAt    DateTime  @default(now())
+  resolvedAt   DateTime?
+
+  @@index([status, createdAt])
+}
+
+model ScoringConfigVersion {
+  id        String   @id @default(cuid())
+  version   String   @unique
+  config    String // JSON snapshot
+  createdAt DateTime @default(now())
+}
+
+// Backs the scheduler's due() check so a restart never double-runs or skips (§10.3)
+model JobExecution {
+  id         String    @id @default(cuid())
+  jobName    String
+  fixtureId  String?
+  leagueId   String?
+  status     String    @default("RUNNING") // RUNNING|COMPLETED|FAILED
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  error      String?
+
+  @@index([jobName, fixtureId])
+  @@index([startedAt])
+}

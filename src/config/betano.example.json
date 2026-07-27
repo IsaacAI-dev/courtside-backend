@@ -1,0 +1,38 @@
+{
+  "_comment": "Produced by `npm run discover:betano` or `npm run discover:har` (spec §5.2.2). Copy to betano.json and fill in. Betano.ng runs on Kaizen Gaming's platform: responses are a NORMALIZED STORE of three flat ID-keyed maps (events, markets, selections) joined by marketIdList/selectionIdList, with the handicap on the SELECTION. The adapter detects and joins this automatically.",
+
+  "_confirmed_20260721": {
+    "storeShape": "{ events, markets, selections } — flat maps, joined by ID",
+    "handicapLocation": "on the selection, e.g. { name: 'Over 18.5', handicap: 18.5, price: 1.9 }",
+    "basketballFilter": "event.sportId === 'BASK' (or event.ardSportId === 2)",
+    "startTime": "epoch milliseconds",
+    "gameLevelMarketCodes": {
+      "FTPO": "157 — Total Points (game total, NOT a player prop)",
+      "FHOT": "156 — Handicap (spread)",
+      "H2HT": "155 — Winner (moneyline)"
+    },
+    "coverageWarning": "The coupon/list response hydrates only ~3 headline markets per event even when totalMarketsAvailable is 200+. Player props require the per-event request fired when the event page's Players tab opens.",
+    "note": "Esports basketball also reports sportId BASK — team names carry a handle in brackets, e.g. 'Denver Nuggets (TAAPZ)'. Filter these out by league, or by rejecting names matching /\\([A-Z0-9]+\\)$/."
+  },
+
+  "fixturesUrl": "",
+  "eventUrlTemplate": "",
+  "playerPropsUrlTemplate": "",
+
+  "headers": {
+    "Accept": "application/json",
+    "Accept-Language": "en-NG,en;q=0.9",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+  },
+
+  "_marketMapNote": "Matched against market.name. Once the player-prop TYPE CODES are known from `--census`, prefer matching on those: codes are stable across locales, display names are not.",
+  "marketMap": [
+    { "pattern": "player points(?! \\+)", "market": "POINTS" },
+    { "pattern": "player assists", "market": "ASSISTS" },
+    { "pattern": "player rebounds", "market": "REBOUNDS" },
+    { "pattern": "player 3[- ]point(ers)?( field goals)?( made)?", "market": "THREES" }
+  ],
+
+  "_marketTypeMapNote": "Preferred once known: exact Kaizen type codes from the census, e.g. { \"PLPT\": \"POINTS\" }. Leave empty until confirmed.",
+  "marketTypeMap": {}
+}

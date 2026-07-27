@@ -1,0 +1,60 @@
+{
+  "_comment": "CONFIRMED against a live Betano.ng capture, 21 July 2026 (WNBA: Golden State Valkyries vs Washington Mystics, event 88623579). The Players tab is served by /api/match-odds/{slug}/{eventId}/ with isPlayersToggle=true. Verify these still work after any site change — the shape-hash drift detector (§5.2.5) will flag it.",
+
+  "fixturesUrl": "https://www.betano.ng/api/sport/basketball/usa/wnba/440g/?req=la,s,stnf,c,mb",
+  "_leagueCodeNote": "CONFIRMED 22 Jul 2026, end-to-end against a real captured payload: this URL's data.blocks[] contains a WNBA block (id 17089, name 'USA - WNBA (W)') whose events[] are real games — parseBetanoFixtures correctly extracted all 7, with real team names, correct near-term dates (matching SofaScore's independently-reported dates to the second), and zero false positives. This replaced /api/sport/basketball/competitions/usa/11326/?sl=440g&req=... — that URL was NEVER directly verified to return this same shape; this one was tested and confirmed. The earlier sl=441g (NBA) vs sl=440g (WNBA) mixup — both basketball, both regionId 11326 — is what silently produced NBA data (including the 'Division Winner - Atlantic/Central/Southeast' phantom fixtures) for this entire debugging session.",
+
+  "_eventPathNote": "Each event record carries its own path: /match-odds/{slug}/{id}/ pre-match, /live/{slug}/{id}/ in-play. Substitute it into the template below rather than rebuilding the slug from team names.",
+  "playerPropsUrlTemplate": "https://www.betano.ng/api{eventPath}?bt=1&isPlayersToggle=true&req=la,s,stnf,c,mb,mbl",
+  "eventUrlTemplate": "https://www.betano.ng/api{eventPath}?bt=1&req=la,s,stnf,c,mb,mbl",
+
+  "_reqParamNote": "req= is a field-inclusion list. la,s,stnf,c,mb,mbl returns layout, selections, stats-and-info, competition, market-body and market-body-long. Dropping mbl loses the selection ladders. isPlayersToggle=true is what switches the response to the Players tab.",
+
+  "headers": {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-NG,en;q=0.9",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Referer": "https://www.betano.ng/sport/basketball/",
+    "X-Requested-With": "XMLHttpRequest"
+  },
+
+  "_marketTypeNote": "Type CODES are the reliable key — display names are localised, codes are not. Confirmed for basketball player props.",
+  "marketTypeMap": {
+    "PLNP": "POINTS",
+    "PALA": "ASSISTS",
+    "PLTR": "REBOUNDS",
+    "P3PG": "THREES"
+  },
+  "marketTypeIdMap": {
+    "1856": "POINTS",
+    "1853": "ASSISTS",
+    "1858": "REBOUNDS",
+    "1852": "THREES"
+  },
+
+  "_marketMapFallback": "Used only when a type code is unrecognised.",
+  "marketMap": [
+    { "pattern": "total three point shots scored", "market": "THREES" },
+    { "pattern": "total points(?!,)", "market": "POINTS" },
+    { "pattern": "total assists", "market": "ASSISTS" },
+    { "pattern": "total rebounds(?! and)", "market": "REBOUNDS" }
+  ],
+
+  "_milestoneNote": "Betano prices these as milestones ('12+' = 12 or more), NOT Over/Under. Since these stats are integers, '12+' is exactly 'Over 11.5', so lines are stored as n-0.5. There is no Under side and no Under price. See src/adapters/betano/matchOdds.ts.",
+
+  "_alsoOffered": {
+    "BPRA": "Points+Rebounds+Assists (3096)",
+    "BBRA": "Rebounds+Assists (3095)",
+    "X035": "Double-Double (1797)",
+    "X043": "Top Points Scorer (2021)",
+    "X046": "Top Rebounder (2020)",
+    "X238": "Top Three Point Scorer (1979)",
+    "4748": "Points H2H between two players",
+    "4930": "Rebounds H2H",
+    "4935": "Three Point Shots H2H"
+  },
+
+  "_leagueIds": {
+    "WNBA": { "leagueId": "17089", "regionId": "11326", "leagueUrl": "/sport/basketball/usa/wnba/440g/" }
+  }
+}
