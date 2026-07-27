@@ -120,10 +120,35 @@ export async function executeAnalysisRun(opts: RunOptions): Promise<string> {
     });
     stage('fixtures_selected', { count: fixtures.length });
 
+    // ── Precondition: the player crosswalk must be seeded ───────────────────
+    // Checked once, before any board is fetched. With zero Player rows every
+    // prop fails all six resolution tiers and lands in the review queue, and
+    // the run then reports COMPLETED with nothing in it — the exact failure
+    // mode observed on 27 Jul 2026 (959 props fetched, 0 written, status
+    // COMPLETED). Nothing downstream can succeed in that state, so fail the
+    // run loudly with the command that fixes it rather than burning a
+    // Chromium escalation per fixture to produce an empty board.
+    if (fixtures.length > 0) {
+      const seededPlayers = await prisma.player.count({ where: { leagueId: opts.leagueId } });
+      if (seededPlayers === 0) {
+        const msg =
+          `player crosswalk is empty for ${opts.leagueId} — run \`npm run bootstrap -- --league ${opts.leagueId}\` before analysing`;
+        log.error({ leagueId: opts.leagueId }, msg);
+        sourceErrors.push({ source: 'LEAGUE', error: msg });
+        throw new PipelineFatal(msg, null);
+      }
+    }
+
     let playersConsidered = 0;
     let playersExcluded = 0;
     let recommendationsEmitted = 0;
     let boardHadLines = false;
+    // Props Betano actually returned this run, and how many of them failed
+    // entity resolution. `boardHadLines` alone can't see these: it is derived
+    // from PropLine rows WRITTEN, so a total resolution failure looks
+    // identical to Betano offering no board at all.
+    let propsFetched = 0;
+    let propsUnresolved = 0;
 
     // League pace/def distributions for matchup z-scores.
     const leagueTeams = await prisma.team.findMany({ where: { leagueId: opts.leagueId } });
@@ -141,7 +166,9 @@ export async function executeAnalysisRun(opts: RunOptions): Promise<string> {
       if (!opts.skipScrape) {
         stage('harvest_board', { fixtureId: fixture.id });
         try {
-          await harvestBoard(fixture.id);
+          const harvest = await harvestBoard(fixture.id);
+          propsFetched += harvest.fetched;
+          propsUnresolved += harvest.unresolved;
         } catch (err) {
           sourceErrors.push({ source: 'BETANO', error: `board ${fixture.id}: ${err}` });
           throw new PipelineFatal(`board harvest failed for fixture ${fixture.id}`, err);
@@ -154,10 +181,14 @@ export async function executeAnalysisRun(opts: RunOptions): Promise<string> {
           sourceErrors.push({ source: 'LEAGUE', error: `stats ${fixture.id}: ${err}` });
         }
         try {
+          // sweepLineupAbsences now rethrows anything that isn't "lineups not
+          // published yet", so this catch can finally do its job — it used to
+          // be unreachable because the callee swallowed every error itself.
           await sweepLineupAbsences(fixture.id);
         } catch (err) {
           degraded = true;
-          sourceErrors.push({ source: 'SOFASCORE', error: `lineups ${fixture.id}: ${err}` });
+          sourceErrors.push({ source: 'SOFASCORE', error: `lineups ${fixture.id}: ${describeError(err)}` });
+          log.warn({ fixtureId: fixture.id, err: describeError(err) }, 'lineup sweep failed — run marked DEGRADED');
         }
       }
 
@@ -349,10 +380,28 @@ export async function executeAnalysisRun(opts: RunOptions): Promise<string> {
     }
 
     // ── Stage 7: finalise ──
-    // Alarm condition (§11.4): a non-empty board that produces zero output and
-    // zero exclusions means the pipeline is broken, not that there's no value.
-    if (boardHadLines && recommendationsEmitted === 0 && playersExcluded === 0) {
-      log.error('ALARM: non-empty board produced zero recommendations AND zero exclusions — pipeline fault');
+    // Alarm condition (§11.4), in two parts.
+    //
+    // (a) Betano returned a board and NONE of it resolved. This is the case
+    //     the original alarm below could not see: it keys off PropLine rows
+    //     written, so a total resolution failure and an empty board are
+    //     indistinguishable to it — both leave `boardHadLines` false. A book
+    //     that answered with hundreds of props while the pipeline persisted
+    //     none of them is broken, not quiet.
+    if (propsFetched > 0 && propsUnresolved === propsFetched) {
+      degraded = true;
+      const msg = `${propsFetched} props fetched from Betano, 0 resolved to a known player — entity resolution fault, not an empty board`;
+      log.error({ propsFetched, propsUnresolved }, `ALARM: ${msg}`);
+      sourceErrors.push({ source: 'RESOLUTION', error: msg });
+    }
+
+    // (b) The original: a non-empty board that produces zero output and zero
+    //     exclusions means the pipeline is broken, not that there's no value.
+    if ((boardHadLines || propsFetched > 0) && recommendationsEmitted === 0 && playersExcluded === 0) {
+      log.error(
+        { boardHadLines, propsFetched, propsUnresolved },
+        'ALARM: non-empty board produced zero recommendations AND zero exclusions — pipeline fault',
+      );
     }
 
     const finished = new Date();

@@ -5,6 +5,7 @@
 import { prisma } from '../db/client';
 import { env } from '../env';
 import { logger } from '../lib/logger';
+import { HOUR_MS } from '../lib/dates';
 import { normaliseName } from '../lib/normalise';
 import { resolvePlayer } from './entityResolver';
 import { fetchBetanoPlayerProps } from '../adapters/betano/adapter';
@@ -27,14 +28,56 @@ export function statsConfigFor(league: { statsHost: string; statsLeagueId: strin
   };
 }
 
+/**
+ * Extract an HTTP status from either error shape this codebase throws:
+ * `HttpError` (src/lib/http.ts) carries `.status` as a real field, and
+ * `pageFetchJson` (src/adapters/betano/browser.ts) attaches `.status` to a
+ * plain Error. The message-regex fallback is a last resort for anything
+ * wrapped on the way up.
+ */
+function httpStatusOf(err: unknown): number | null {
+  const s = (err as { status?: unknown } | null | undefined)?.status;
+  if (typeof s === 'number') return s;
+  const m = /\bHTTP (\d{3})\b/.exec(String(err));
+  return m ? Number(m[1]) : null;
+}
+
+/**
+ * How close to tip-off a fixture must be before it is worth asking SofaScore
+ * for lineups at all.
+ *
+ * Lineups are not published for a game several days out — the endpoint 404s,
+ * which is a correct answer to a premature question, not a failure. Asking
+ * anyway costs a full direct-tier 403 plus a Chromium in-page escalation
+ * (~4s per fixture) to be told nothing, and produces a WARN that looks
+ * identical to a real source outage.
+ *
+ * 6 hours is a deliberately conservative guess — the actual publication time
+ * has not been confirmed. Widen it if absences start arriving too late to be
+ * useful; the only cost of a larger window is the wasted request this
+ * constant exists to avoid.
+ */
+const LINEUP_PUBLISH_WINDOW_HOURS = 6;
+
+export interface HarvestResult {
+  /** PropLine rows actually written (resolved to a known Player). */
+  lines: number;
+  /** Props returned by Betano that could not be resolved to a Player. */
+  unresolved: number;
+  /** Props returned by Betano, before resolution. `lines + unresolved`. */
+  fetched: number;
+  /** True when the harvest was skipped because no players are seeded. */
+  crosswalkEmpty?: boolean;
+}
+
 /** Stage 2 — harvest the Betano board for one fixture into PropLine snapshots. */
-export async function harvestBoard(fixtureId: string): Promise<{ lines: number; unresolved: number }> {
+export async function harvestBoard(fixtureId: string): Promise<HarvestResult> {
   const fixture = await prisma.fixture.findUniqueOrThrow({
     where: { id: fixtureId },
     include: { sourceLinks: true },
   });
   const link = fixture.sourceLinks.find((l) => l.source === 'BETANO');
-  if (!link) return { lines: 0, unresolved: 0 };
+  if (!link) return { lines: 0, unresolved: 0, fetched: 0 };
 
   // The real event path (e.g. "/match-odds/team-a-team-b/12345/") was
   // captured at reconciliation time into rawPayload — Betano's match-odds
@@ -49,7 +92,26 @@ export async function harvestBoard(fixtureId: string): Promise<{ lines: number; 
   }
   if (!eventPath) {
     logger.warn({ fixtureId, externalId: link.externalId }, 'no event path captured for this Betano fixture — cannot fetch player props');
-    return { lines: 0, unresolved: 0 };
+    return { lines: 0, unresolved: 0, fetched: 0 };
+  }
+
+  // ── Precondition: the crosswalk must be seeded ──────────────────────────
+  // With zero Player rows, every prop falls through all six resolution tiers
+  // into the review queue — hundreds of PENDING items with empty candidate
+  // lists, none of which is a real entity-resolution problem. The board fetch
+  // itself is also pure waste in that state (a Chromium escalation per
+  // fixture to produce nothing), so bail before it rather than after.
+  //
+  // The pipeline checks this once per run before the fixture loop; this guard
+  // covers the paths that don't go through the pipeline — the scheduler's
+  // BOARD_HARVEST job and POST /ingestion/refresh with scope=LINES.
+  const seededPlayers = await prisma.player.count({ where: { leagueId: fixture.leagueId } });
+  if (seededPlayers === 0) {
+    logger.error(
+      { fixtureId, leagueId: fixture.leagueId, fix: `npm run bootstrap -- --league ${fixture.leagueId}` },
+      'player crosswalk is EMPTY for this league — board harvest skipped; nothing can resolve until it is seeded',
+    );
+    return { lines: 0, unresolved: 0, fetched: 0, crosswalkEmpty: true };
   }
 
   const props = await fetchBetanoPlayerProps(eventPath);
@@ -92,6 +154,10 @@ export async function harvestBoard(fixtureId: string): Promise<{ lines: number; 
   // Show actual failed raw names next to a real sample of what's seeded for
   // this league, so a systematic mismatch (format, case, suffix handling)
   // is visible directly rather than inferred from a bare count.
+  //
+  // The empty-crosswalk case — which is what this diagnostic actually caught
+  // the first time it ran — now short-circuits above, so reaching here means
+  // there IS a seeded population and the sample below is a real comparison.
   if (written === 0 && unresolved > 0) {
     const seededSample = await prisma.player.findMany({
       where: { leagueId: fixture.leagueId },
@@ -104,15 +170,15 @@ export async function harvestBoard(fixtureId: string): Promise<{ lines: number; 
         failedRawNames,
         failedRawNamesNormalised: failedRawNames.map((n) => normaliseName(n)),
         seededSample,
-        seededTotalForLeague: await prisma.player.count({ where: { leagueId: fixture.leagueId } }),
+        seededTotalForLeague: seededPlayers,
       },
       'ALL player props failed resolution for this fixture — real names vs real seed, side by side',
     );
   }
 
   // Flag main lines: per player+market, the line closest to the latest capture's median.
-  logger.info({ fixtureId, written, unresolved }, 'board harvested');
-  return { lines: written, unresolved };
+  logger.info({ fixtureId, fetched: props.length, written, unresolved }, 'board harvested');
+  return { lines: written, unresolved, fetched: props.length };
 }
 
 /** Stage 3a — refresh L15 game logs for every player carrying lines on a fixture. */
@@ -194,7 +260,23 @@ export async function sweepInjuries(leagueId: LeagueId): Promise<number> {
   return updates;
 }
 
-/** Lineup absence sweep for imminent fixtures (SofaScore missingPlayers). */
+/**
+ * Lineup absence sweep for imminent fixtures (SofaScore missingPlayers).
+ *
+ * Three distinct outcomes, previously collapsed into one swallowed WARN:
+ *
+ *   1. Fixture is days away → skipped without a request. Lineups don't exist
+ *      yet; asking costs ~4s and answers nothing.
+ *   2. 404 from the endpoint → lineups genuinely not published. Logged at
+ *      info, returns 0. NOT a source failure.
+ *   3. Anything else (403, 5xx, transport, session expiry) → RETHROWN, so the
+ *      caller can mark the run DEGRADED.
+ *
+ * Case 3 is the behaviour change that matters. This function used to catch
+ * everything internally and return 0, so the `catch` in pipeline.ts that sets
+ * `degraded = true` could never fire — a run in which this source failed on
+ * every single fixture still reported COMPLETED.
+ */
 export async function sweepLineupAbsences(fixtureId: string): Promise<number> {
   const fixture = await prisma.fixture.findUniqueOrThrow({
     where: { id: fixtureId },
@@ -202,21 +284,40 @@ export async function sweepLineupAbsences(fixtureId: string): Promise<number> {
   });
   const link = fixture.sourceLinks.find((l) => l.source === 'SOFASCORE');
   if (!link) return 0;
-  let updates = 0;
+
+  const hoursToTip = (fixture.startsAt.getTime() - Date.now()) / HOUR_MS;
+  if (hoursToTip > LINEUP_PUBLISH_WINDOW_HOURS) {
+    logger.info(
+      { fixtureId, hoursToTip: Math.round(hoursToTip * 10) / 10, windowHours: LINEUP_PUBLISH_WINDOW_HOURS },
+      'lineup sweep skipped — fixture too far out for lineups to be published',
+    );
+    return 0;
+  }
+
+  let lineups;
   try {
-    const lineups = await fetchSofaLineups(link.externalId);
-    for (const entry of lineups.filter((p) => p.missingReason != null)) {
-      const resolved = await resolvePlayer('SOFASCORE', entry.name, {
-        externalId: entry.externalId,
-        leagueId: fixture.leagueId,
-        fixtureId,
-      });
-      if (!resolved.playerId) continue;
-      await recordInjury(resolved.playerId, 'OUT', `SofaScore lineup absence: ${entry.missingReason}`, 'SOFASCORE', new Date());
-      updates++;
-    }
+    lineups = await fetchSofaLineups(link.externalId);
   } catch (err) {
-    logger.warn({ fixtureId, err: String(err) }, 'lineup sweep failed');
+    if (httpStatusOf(err) === 404) {
+      logger.info(
+        { fixtureId, eventExternalId: link.externalId },
+        'lineups not published for this fixture yet — not a source failure',
+      );
+      return 0;
+    }
+    throw err; // real failure — the caller decides what it means for the run
+  }
+
+  let updates = 0;
+  for (const entry of lineups.filter((p) => p.missingReason != null)) {
+    const resolved = await resolvePlayer('SOFASCORE', entry.name, {
+      externalId: entry.externalId,
+      leagueId: fixture.leagueId,
+      fixtureId,
+    });
+    if (!resolved.playerId) continue;
+    await recordInjury(resolved.playerId, 'OUT', `SofaScore lineup absence: ${entry.missingReason}`, 'SOFASCORE', new Date());
+    updates++;
   }
   return updates;
 }
@@ -243,6 +344,19 @@ export async function recordInjury(
 export async function bootstrapPlayerIndex(leagueId: LeagueId): Promise<number> {
   const league = await prisma.leagueConfig.findUniqueOrThrow({ where: { id: leagueId } });
   const rows = await fetchPlayerIndex(statsConfigFor(league));
+
+  // An empty index is not a success. It means the endpoint answered but the
+  // first resultSet had no rows — a season string the feed doesn't recognise,
+  // or a shape change — and the caller would otherwise print "players
+  // created: 0" as though it had done its job.
+  if (rows.length === 0) {
+    logger.error(
+      { leagueId, season: league.currentSeason, statsHost: league.statsHost },
+      'player index returned ZERO rows — the request succeeded but the first resultSet was empty; check the season string against the feed',
+    );
+    return 0;
+  }
+
   let created = 0;
   for (const row of rows) {
     const normalised = normaliseName(row.fullName);
